@@ -1,11 +1,12 @@
 from typing import Optional
-
-from PyMemoryEditor import OpenProcess
+import re, time, asyncio, sys
 
 import Utils
-
-import re, time, asyncio, sys
 from CommonClient import logger, server_loop, get_base_parser, gui_enabled
+
+from .pj64_connector import PJ64Context, pj64connect
+from .constants import *
+from .update_pj64_config import safe_load_pj64_config
 
 _tracker_loaded = False
 try:
@@ -14,12 +15,6 @@ try:
     _tracker_loaded = True
 except ImportError:
     from CommonClient import CommonContext, ClientCommandProcessor
-
-CLIENT_NAME: str = "Pokemon_Snap_Client"
-
-INITIAL_STATUS: str = "Waiting to connect to Project 64"
-WRONG_GAME: str = "Wrong game was detected, please load a North American version of Pokemon Snap"
-CONNECTED_STATUS: str = "Successfully connected to Project64 and detected Pokemon Snap."
 
 class PokemonSnapCommandProcessor(ClientCommandProcessor):
     def __init__(self, ctx: CommonContext, server_address: str = None):
@@ -32,7 +27,7 @@ class PokemonSnapCommandProcessor(ClientCommandProcessor):
         if isinstance(self.ctx, PokemonSnapContext):
             logger.info(f"Project64 Status: {self.ctx.pj64_status}")
 
-class PokemonSnapContext(CommonContext):
+class PokemonSnapContext(CommonContext, PJ64Context):
     command_processor = PokemonSnapCommandProcessor
     game = "Pokemon Snap"
     items_handling = 0b111
@@ -41,17 +36,19 @@ class PokemonSnapContext(CommonContext):
     pj64_sync_task: Optional[asyncio.Task[None]] = None
     pj64_status: str
 
-    def __init__(self, server_address, password):
+    def __init__(self, server_address, password, ap_port):
         """
         Initialize the Pokemon Snap Universal Context.
 
         :param server_address: Address of the Archipelago server.
         :param password: Password for server authentication.
         """
-        super().__init__(server_address, password)
+        CommonContext.__init__(self, server_address, password)
+        PJ64Context.__init__(self, ap_port)
         self.instance_id = None
         self.tracker_enabled = _tracker_loaded
         self.pj64_status = INITIAL_STATUS
+        self.ap_port = ap_port
 
     def on_package(self, cmd: str, args: dict):
         """
@@ -60,7 +57,7 @@ class PokemonSnapContext(CommonContext):
         :param cmd: The command received from the server.
         :param args: The command arguments.
         """
-        super().on_package(cmd, args)
+        CommonContext.on_package(cmd, args)
         match cmd:
             case "PrintJSON":
                 if args.get("type", "") == "Countdown" and len(list(args.get("data", []))) > 0 and \
@@ -93,7 +90,7 @@ class PokemonSnapContext(CommonContext):
         # Performing local import to prevent additional UIs to appear during the patching process.
         # This appears to be occurring if a spawned process does not have a UI element when importing kvui/kivymd.
         from kvui import GameManager
-        ui: type[GameManager] = super().make_gui()
+        ui: type[GameManager] = CommonContext.make_gui()
         class UniversalWrapper(ui):
             base_title: str = "Pokemon Snap Client"
 
@@ -112,13 +109,13 @@ class PokemonSnapContext(CommonContext):
         pass
 
     async def disconnect(self, allow_autoreconnect: bool = False):
-        await super().disconnect(allow_autoreconnect)
+        await CommonContext.disconnect(self, allow_autoreconnect)
         self.pj64_status = INITIAL_STATUS
 
     async def wait_for_next_loop(self, time_to_wait: float):
         await asyncio.sleep(time_to_wait)
 
-    async def pj64_sync_main_task(self, pj64_process: OpenProcess):
+    async def pj64_sync_main_task(self):
         logger.info(f"Using {CLIENT_NAME} client...")
         logger.info("Starting Project64 connector. Use /project64 for status information.")
 
@@ -126,30 +123,30 @@ class PokemonSnapContext(CommonContext):
             while not self.exit_event.is_set():
                 try:
                     if not self.pj64_status == CONNECTED_STATUS:
-                        var = pj64_process.read_process_memory(0xDFE40000, int, 4)
-                        print(str(var))
+                        await pj64connect(self)
 
-                        # TODO validate game ID here
-                        if not self.auth:
-                            await self.get_username()
-                            await self.server_auth()
+                        if not self.pj64_status == CONNECTING_STATUS:
+                            self.pj64_status = CONNECTING_STATUS
+                            logger.info(self.pj64_status)
 
                         if not self.slot:
                             await self.wait_for_next_loop(5)
                             continue
 
                         # TODO validate seed here
+                        # TODO validate GameID here or in PJ64 loop
+                        # TODO check for in_game or something similar?
+
                         self.pj64_status = CONNECTED_STATUS
                         logger.info(self.pj64_status)
-
-                    # TODO check for in_game or something similar?
 
                     await self.check_snap_locations()
                     await self.receive_snap_items()
 
                 except Exception as ex:
                     logger.error(str(ex))
-                    logger.info("Connection to Project64 Failed, retrying in 5 seconds...")
+                    self.pj64_status = DISCONNECTED_STATUS
+                    logger.info(DISCONNECTED_STATUS)
                     await self.disconnect()
                     await self.wait_for_next_loop(5)
                     continue
@@ -187,12 +184,11 @@ def main(*launch_args: str):
 
     async def _main(connect, password):
         try:
-            ctx = PokemonSnapContext(server_address if server_address else connect, password)
+            ap_port = safe_load_pj64_config()
+            ctx = PokemonSnapContext(server_address if server_address else connect, password, ap_port)
             ctx.server_task = asyncio.create_task(server_loop(ctx), name="ServerLoop")
 
-            # TODO Need to have Project64 open prior to running this client.
-            pj64_process: OpenProcess = OpenProcess(process_name="Project64.exe")
-            ctx.pj64_sync_task = asyncio.create_task(ctx.pj64_sync_main_task(pj64_process), name="PokemonSnap_PJ64Sync")
+            ctx.pj64_sync_task = asyncio.create_task(ctx.pj64_sync_main_task(), name="PokemonSnap_PJ64Sync")
 
             # Runs Universal Tracker's internal generator
             ctx._main()
